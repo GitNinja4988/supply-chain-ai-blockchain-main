@@ -1,0 +1,20 @@
+# Web Framework
+Flask==3.1.0
+Werkzeug==3.1.3
+Jinja2==3.1.5
+
+# Data Processing
+numpy==1.26.0
+scikit-learn==1.6.1
+
+# Route Optimization
+geopy==2.4.1
+
+# Date and Time
+python-dateutil==2.9.0
+
+# Security
+bcrypt==4.1.2
+cryptography==42.0.2
+pycryptodome==3.20.0
+web3==6.15.1
