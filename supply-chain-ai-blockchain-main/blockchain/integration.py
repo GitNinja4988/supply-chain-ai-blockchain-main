@@ -7,6 +7,7 @@ from typing import Dict, List, Optional
 import logging
 from .security import CryptographicSecurity
 import base64
+import threading
 
 class SmartContract:
     """
@@ -52,9 +53,21 @@ class BlockchainIntegration:
         else:
             self.web3 = None
 
-        # Cache for transaction data with encryption
+        # Enhanced caching with TTL
         self.transaction_cache = {}
+        self.cache_ttl = 3600  # 1 hour TTL
+        self.last_cache_cleanup = datetime.now()
+        
+        # Batch processing queue with retry mechanism
+        self.transaction_queue = []
+        self.failed_transactions = []
+        self.batch_size = 10
+        self.batch_timeout = 60  # seconds
+        self.max_retries = 3
+        self.retry_delay = 5  # seconds
+        
         self._setup_encryption()
+        self._start_retry_worker()
 
     def _setup_encryption(self):
         """Setup encryption for sensitive data"""
@@ -90,6 +103,143 @@ class BlockchainIntegration:
                 decrypted_data[key] = value
         return decrypted_data
 
+    def _cleanup_expired_cache(self):
+        """Clean up expired cache entries"""
+        current_time = datetime.now()
+        if (current_time - self.last_cache_cleanup).seconds > self.cache_ttl:
+            expired_keys = [
+                k for k, v in self.transaction_cache.items()
+                if (current_time - v['timestamp']).seconds > self.cache_ttl
+            ]
+            for k in expired_keys:
+                del self.transaction_cache[k]
+            self.last_cache_cleanup = current_time
+
+    def _start_retry_worker(self):
+        """Start background thread for retrying failed transactions"""
+        def retry_worker():
+            while True:
+                if self.failed_transactions:
+                    retry_batch = self.failed_transactions[:self.batch_size]
+                    self.failed_transactions = self.failed_transactions[self.batch_size:]
+                    
+                    for tx in retry_batch:
+                        if tx['retries'] < self.max_retries:
+                            try:
+                                self._create_transaction(tx['data'])
+                                self.logger.info(f"Successfully retried transaction: {tx['data'].get('transaction_hash')}")
+                            except Exception as e:
+                                self.logger.error(f"Retry failed for transaction: {str(e)}")
+                                tx['retries'] += 1
+                                self.failed_transactions.append(tx)
+                        else:
+                            self.logger.error(f"Transaction failed after {self.max_retries} retries: {tx['data'].get('transaction_hash')}")
+                
+                threading.Event().wait(self.retry_delay)
+                
+        thread = threading.Thread(target=retry_worker, daemon=True)
+        thread.start()
+
+    def _process_batch_transactions(self):
+        """Process queued transactions in batch with improved error handling"""
+        if not self.transaction_queue:
+            return
+            
+        try:
+            batch_data = self.transaction_queue[:self.batch_size]
+            self.transaction_queue = self.transaction_queue[self.batch_size:]
+            
+            # Process batch
+            for data in batch_data:
+                try:
+                    self._create_transaction(data)
+                except Exception as e:
+                    self.logger.error(f"Transaction failed: {str(e)}")
+                    self.failed_transactions.append({
+                        'data': data,
+                        'retries': 0,
+                        'last_error': str(e)
+                    })
+                
+        except Exception as e:
+            self.logger.error(f"Batch processing failed: {str(e)}")
+            # Add failed transactions to retry queue
+            for data in batch_data:
+                self.failed_transactions.append({
+                    'data': data,
+                    'retries': 0,
+                    'last_error': str(e)
+                })
+
+    def _create_transaction(self, data: Dict) -> str:
+        """Create a blockchain transaction with cryptographic security and improved error handling"""
+        try:
+            # Generate transaction hash
+            transaction_hash = self.security.hash_transaction(data)
+            
+            # Sign the transaction
+            signature = self.security.sign_data(data)
+            
+            # Add cryptographic metadata
+            data['transaction_hash'] = transaction_hash
+            data['signature'] = signature.hex()
+            data['merkle_root'] = self.security.generate_merkle_root(
+                list(self.transaction_cache.values()) + [data]
+            )
+
+            if self.web3 and self.web3.isConnected():
+                try:
+                    # Here we would interact with the actual blockchain
+                    self.contract.emit_event(data['type'], data)
+                except Exception as e:
+                    self.logger.error(f"Blockchain interaction failed: {str(e)}")
+                    raise
+            else:
+                # Fallback to local storage with encryption
+                self.transaction_cache[transaction_hash] = {
+                    'data': data,
+                    'timestamp': datetime.now()
+                }
+                # Clean up expired cache entries
+                self._cleanup_expired_cache()
+
+            self.logger.info(f"Created transaction: {transaction_hash}")
+            return transaction_hash
+
+        except Exception as e:
+            self.logger.error(f"Transaction creation failed: {str(e)}")
+            raise
+
+    def get_transaction_status(self, transaction_hash: str) -> Dict:
+        """Get detailed status of a transaction including retry attempts"""
+        status = {
+            'hash': transaction_hash,
+            'status': 'unknown',
+            'retries': 0,
+            'last_error': None
+        }
+        
+        # Check in transaction cache
+        if transaction_hash in self.transaction_cache:
+            status['status'] = 'completed'
+            return status
+            
+        # Check in failed transactions
+        for tx in self.failed_transactions:
+            if tx['data'].get('transaction_hash') == transaction_hash:
+                status['status'] = 'failed'
+                status['retries'] = tx['retries']
+                status['last_error'] = tx['last_error']
+                return status
+                
+        # Check in current queue
+        for tx in self.transaction_queue:
+            if tx.get('transaction_hash') == transaction_hash:
+                status['status'] = 'pending'
+                return status
+                
+        return status
+
     def record_sensor_data(self, sensor_id: str, data: Dict) -> str:
         """Record sensor data on the blockchain with encryption"""
         try:
@@ -99,7 +249,16 @@ class BlockchainIntegration:
                 'data': self._encrypt_sensitive_data(data),
                 'timestamp': datetime.now().isoformat()
             }
-            return self._create_transaction(transaction_data)
+            
+            # Add to batch queue
+            self.transaction_queue.append(transaction_data)
+            
+            # Process batch if size threshold reached
+            if len(self.transaction_queue) >= self.batch_size:
+                self._process_batch_transactions()
+                
+            return self.security.hash_transaction(transaction_data)
+            
         except Exception as e:
             self.logger.error(f"Error recording sensor data: {str(e)}")
             raise
@@ -161,36 +320,6 @@ class BlockchainIntegration:
             return self._create_transaction(transaction_data)
         except Exception as e:
             self.logger.error(f"Error recording quality check: {str(e)}")
-            raise
-
-    def _create_transaction(self, data: Dict) -> str:
-        """Create a blockchain transaction with cryptographic security"""
-        try:
-            # Generate transaction hash
-            transaction_hash = self.security.hash_transaction(data)
-            
-            # Sign the transaction
-            signature = self.security.sign_data(data)
-            
-            # Add cryptographic metadata
-            data['transaction_hash'] = transaction_hash
-            data['signature'] = signature.hex()
-            data['merkle_root'] = self.security.generate_merkle_root(
-                list(self.transaction_cache.values()) + [data]
-            )
-
-            if self.web3 and self.web3.isConnected():
-                # Here we would interact with the actual blockchain
-                self.contract.emit_event(data['type'], data)
-            else:
-                # Fallback to local storage with encryption
-                self.transaction_cache[transaction_hash] = data
-
-            self.logger.info(f"Created transaction: {transaction_hash}")
-            return transaction_hash
-
-        except Exception as e:
-            self.logger.error(f"Transaction creation failed: {str(e)}")
             raise
 
     def verify_transaction(self, transaction_hash: str) -> Dict:

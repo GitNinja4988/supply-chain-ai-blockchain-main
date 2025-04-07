@@ -5,6 +5,8 @@ import os
 import sys
 from datetime import datetime
 import logging
+import base64
+from typing import Dict
 
 # Add the parent directory to Python path for imports
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
